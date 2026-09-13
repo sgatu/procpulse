@@ -395,4 +395,4 @@ Open an **Administrator PowerShell**:
 
 ## License
 
-Internal proprietary monitoring tool.
+This project is licensed under the [MIT License](LICENSE.md). See the [LICENSE.md](LICENSE.md) file for details.
