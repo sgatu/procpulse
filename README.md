@@ -16,12 +16,12 @@ An ultra-lightweight, continuous Windows process and system telemetry agent writ
   - Full path filtering (e.g. `C:\Apps\Service.exe`).
 - **Robust Multi-Core CPU Calculation**:
   - Uses `GetProcessTimes` kernel and user deltas calculated against monotonic hardware timestamps (`std::time::Instant`).
-  - Normalized against total machine logical core capacity ($[0.0, 100.0\%]$), immune to system clock adjustments and delayed scheduler ticks.
+  - Normalized against total machine logical core capacity (`0.0%` to `100.0%`), immune to system clock adjustments and delayed scheduler ticks.
 - **Dual CPU Accounting & Diagnostics**:
   - **`app_cpu_cycles`**: Cumulative thread cycles executed on hardware via `QueryProcessCycleTime`.
   - **`app_cpu_time_ms`**: Raw scheduler CPU time charged across all threads via `GetProcessTimes`.
   - Enables deriving the diagnostic ratio:
-    $$\text{cycles\_per\_cpu\_second} = \frac{\text{app\_cpu\_cycles}}{\text{app\_cpu\_time\_ms} / 1000.0}$$
+    $$\text{Cycles / CPU Second} = \frac{\text{app CPU cycles}}{\text{app CPU time (ms)} / 1000}$$
     to distinguish real compute spikes from virtualization / scheduler interrupt quantum artifacts under machine load.
 - **Comprehensive Memory Tracking**:
   - **Working Set RAM** (`WorkingSetSize`): Total resident memory.
@@ -172,7 +172,7 @@ timestamp,executable,args,pid,app_cpu_avg,app_cpu_peak,app_cpu_cycles,app_cpu_ti
 | 2 | `executable` | String | – | Process image filename (e.g. `worker-alpha.exe`). |
 | 3 | `args` | String | – | Normalized command-line arguments (e.g. `--server alpha --port 8001`). |
 | 4 | `pid` | Integer (`u32`) | – | Windows Process ID. |
-| 5 | `app_cpu_avg` | Float (`f64`) | % | Average application CPU usage normalized against total machine capacity ($[0.0, 100.0]$). |
+| 5 | `app_cpu_avg` | Float (`f64`) | % | Average application CPU usage normalized against total machine capacity (`0.0%` to `100.0%`). |
 | 6 | `app_cpu_peak` | Float (`f64`) | % | Peak single-sample application CPU usage recorded during the window. |
 | 7 | `app_cpu_cycles` | Integer (`u64`) | Cycles | Total raw hardware CPU cycles consumed across all threads (`QueryProcessCycleTime`). |
 | 8 | `app_cpu_time_ms` | Integer (`u64`) | Milliseconds | Total raw process CPU time (kernel + user) charged across all threads (`GetProcessTimes`). |
@@ -192,16 +192,16 @@ timestamp,executable,args,pid,app_cpu_avg,app_cpu_peak,app_cpu_cycles,app_cpu_ti
 
 #### Monotonic Timing & Skew Immunity
 Many tools calculate per-process CPU usage simply as:
-$$\text{Process CPU \%} = \frac{\Delta \text{proc\_time}}{\Delta \text{sys\_total}} \times 100$$
+$$\text{Process CPU \%} = \frac{\Delta \text{Process Time}}{\Delta \text{System Total Time}} \times 100$$
 Under heavy system load, the monitor thread can be preempted between the system and process queries. For lightweight processes (~0.05%–0.5% CPU), this timing divergence causes noticeable proportional skew.
 
 To guarantee mathematical consistency, `procpulse` tracks each process using **per-process monotonic hardware timestamps** (`std::time::Instant`):
-$$\text{app\_cpu\_avg \%} = \frac{\Delta \text{process\_cpu\_time}}{\Delta \text{actual\_elapsed\_wall\_time} \times \text{logical\_processor\_count}} \times 100$$
+$$\text{App CPU Avg \%} = \frac{\Delta \text{Process CPU Time}}{\Delta \text{Elapsed Wall Time} \times \text{Logical Cores}} \times 100$$
 This ensures process CPU metrics are strictly bounded and immune to scheduler preemption jitter, time dilation, and system clock adjustments.
 
 #### Diagnosing Performance: Cycles vs. CPU Time
 `procpulse` records both hardware CPU cycles (`app_cpu_cycles`) and scheduler CPU time (`app_cpu_time_ms`), enabling derivation of the **Cycles / CPU Sec** ratio:
-$$\text{cycles\_per\_cpu\_second} = \frac{\text{app\_cpu\_cycles}}{\text{app\_cpu\_time\_ms} / 1000.0}$$
+$$\text{Cycles / CPU Second} = \frac{\text{app CPU cycles}}{\text{app CPU time (ms)} / 1000}$$
 - **High CPU Time + High Cycles**: Genuine compute-bound activity (heavy computational loops, algorithm execution).
 - **High CPU Time + Low Cycles**: Resource contention, hypervisor steal time (in virtual machines / cloud instances), lock contention (spin-lock starvation), or interrupt storms where scheduler time is billed without physical execution cycles.
 
