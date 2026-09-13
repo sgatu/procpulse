@@ -45,7 +45,9 @@ An ultra-lightweight, continuous Windows process and system telemetry agent writ
   - **`app_cpu_cycles`**: Cumulative thread cycles executed on hardware via `QueryProcessCycleTime`.
   - **`app_cpu_time_ms`**: Raw scheduler CPU time charged across all threads via `GetProcessTimes`.
   - Enables deriving the diagnostic ratio:
+  
     $$\text{Cycles / CPU Second} = \frac{\text{app CPU cycles}}{\text{app CPU time (ms)} / 1000}$$
+  
     to distinguish real compute spikes from virtualization / scheduler interrupt quantum artifacts under machine load.
 - **Comprehensive Memory Tracking**:
   - **Working Set RAM** (`WorkingSetSize`): Total resident memory.
