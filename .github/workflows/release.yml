@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run test suite
+        run: cargo test --all
+
+      - name: Build release binary
+        run: cargo build --release --bin procpulse
+
+      - name: Package release archive
+        shell: pwsh
+        run: |
+          $Tag = if ("${{ inputs.tag_name }}" -ne "") {
+              "${{ inputs.tag_name }}"
+          } elseif ($env:GITHUB_REF_NAME) {
+              $env:GITHUB_REF_NAME
+          } else {
+              "v0.1.0"
+          }
+          
+          $PackageDir = "procpulse-windows-x86_64"
+          New-Item -ItemType Directory -Path $PackageDir -Force | Out-Null
+          
+          Copy-Item "target/release/procpulse.exe" -Destination "$PackageDir/"
+          Copy-Item "procpulse.ini.example" -Destination "$PackageDir/"
+          Copy-Item "README.md" -Destination "$PackageDir/"
+          
+          $ZipName = "procpulse-${Tag}-windows-x86_64.zip"
+          Compress-Archive -Path "$PackageDir/*" -DestinationPath $ZipName -Force
+          
+          # Generate SHA256 checksums
+          $ZipHash = (Get-FileHash -Path $ZipName -Algorithm SHA256).Hash.ToLower()
+          "$ZipHash  $ZipName" | Out-File -FilePath "$ZipName.sha256" -Encoding ascii
+          
+          $ExeHash = (Get-FileHash -Path "target/release/procpulse.exe" -Algorithm SHA256).Hash.ToLower()
+          "$ExeHash  procpulse.exe" | Out-File -FilePath "procpulse.exe.sha256" -Encoding ascii
+          
+          echo "ZIP_NAME=$ZipName" >> $env:GITHUB_ENV
+          echo "RELEASE_TAG=$Tag" >> $env:GITHUB_ENV
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.tag_name != '')
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: |
+            ${{ env.ZIP_NAME }}
+            ${{ env.ZIP_NAME }}.sha256
+            target/release/procpulse.exe
+            procpulse.exe.sha256
+            procpulse.ini.example
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
+      - name: Upload build artifacts (on untagged manual run)
+        uses: actions/upload-artifact@v4
+        if: "!startsWith(github.ref, 'refs/tags/') && (github.event_name != 'workflow_dispatch' || inputs.tag_name == '')"
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: |
+            ${{ env.ZIP_NAME }}
+            ${{ env.ZIP_NAME }}.sha256
+            target/release/procpulse.exe
+            procpulse.exe.sha256

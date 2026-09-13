@@ -1,0 +1,44 @@
+# ==============================================================================
+# Ultra-Light Windows Process Telemetry & Load Diagnostics Configuration Example
+# ==============================================================================
+# NOTE: Rename this file to 'procpulse.ini' (remove the '.example' extension)
+# and place it in the same directory as 'procpulse.exe' to take effect.
+# Settings here can always be overridden via command-line arguments.
+# ==============================================================================
+
+# Target executable(s) or wildcard pattern(s) to monitor:
+# Supports:
+#   - Exact executable name: target = MyApplication.exe
+#   - Wildcard pattern (* and ?): target = worker-*.exe, session_??.exe
+#   - Multiple targets (comma or semicolon separated):
+#       target = worker-*.exe, server.exe; daemon.exe
+#   - Full image path: target = C:\Apps\MyApplication.exe
+target = MyApplication.exe
+
+# Output CSV destination path:
+# Default if omitted: procpulse_metrics.csv in the current working directory.
+output = procpulse_metrics.csv
+
+# Metric sampling cadence in seconds:
+# How frequently process and system CPU/RAM are sampled in memory (default: 2).
+sample_interval_secs = 2
+
+# Process discovery cadence in seconds:
+# How frequently procpulse scans for newly spawned or restarted instances (default: 6).
+discovery_interval_secs = 6
+
+# Aggregation and flush cadence in seconds:
+# How frequently averaged and peak statistics are flushed to the CSV file (default: 60).
+aggregation_interval_secs = 60
+
+# Maximum CSV size in bytes before rolling rotation (default: 2097152 [2 MB]).
+# Examples: 1048576 (1 MB), 2097152 (2 MB), 5242880 (5 MB), 10485760 (10 MB).
+# Set to 0 to disable rotation (unlimited size).
+max_bytes = 2097152
+
+# Maximum number of rotated backup files to retain (default: 5).
+# Rotated files are named: <output>.1.csv, <output>.2.csv, ..., <output>.N.csv.
+# Set to 0 to keep no backups (active file is truncated/cleared upon reaching max_bytes).
+max_files = 5
+
+

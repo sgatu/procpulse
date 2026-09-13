@@ -1,0 +1,22 @@
+[package]
+name = "procpulse"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Diagnostics_ToolHelp", "Win32_System_SystemInformation", "Win32_System_Console", "Win32_System_Memory", "Win32_System_Time", "Win32_Security"] }
+
+[[bin]]
+name = "procpulse"
+path = "src/main.rs"
+
+[[bin]]
+name = "dummy_workload"
+path = "tests/fixtures/dummy_workload.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
