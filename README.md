@@ -371,13 +371,13 @@ Open an **Administrator PowerShell**:
 
 ## Grafana & Alloy Telemetry Pipeline
 
-`procpulse` is built to pair with **Grafana Alloy**:
+`procpulse` is built to pair with **Grafana Alloy**. A ready-to-use configuration file is provided in [`examples/alloy/alloy.config`](examples/alloy/alloy.config):
 
 ```
 [Target App]
      │ (Win32 APIs)
      ▼
-[procpulse] ──(writes CSV)──► [metrics.csv]
+[procpulse] ──(writes CSV)──► [procpulse_metrics.csv]
                                    │
                                    ▼ (tails CSV)
                            [Grafana Alloy]
