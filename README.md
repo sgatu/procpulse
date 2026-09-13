@@ -216,16 +216,22 @@ timestamp,executable,args,pid,app_cpu_avg,app_cpu_peak,app_cpu_cycles,app_cpu_ti
 
 #### Monotonic Timing & Skew Immunity
 Many tools calculate per-process CPU usage simply as:
+
 $$\text{Process CPU \%} = \frac{\Delta \text{Process Time}}{\Delta \text{System Total Time}} \times 100$$
+
 Under heavy system load, the monitor thread can be preempted between the system and process queries. For lightweight processes (~0.05%–0.5% CPU), this timing divergence causes noticeable proportional skew.
 
 To guarantee mathematical consistency, `procpulse` tracks each process using **per-process monotonic hardware timestamps** (`std::time::Instant`):
+
 $$\text{App CPU Avg \%} = \frac{\Delta \text{Process CPU Time}}{\Delta \text{Elapsed Wall Time} \times \text{Logical Cores}} \times 100$$
+
 This ensures process CPU metrics are strictly bounded and immune to scheduler preemption jitter, time dilation, and system clock adjustments.
 
 #### Diagnosing Performance: Cycles vs. CPU Time
 `procpulse` records both hardware CPU cycles (`app_cpu_cycles`) and scheduler CPU time (`app_cpu_time_ms`), enabling derivation of the **Cycles / CPU Sec** ratio:
+
 $$\text{Cycles / CPU Second} = \frac{\text{app CPU cycles}}{\text{app CPU time (ms)} / 1000}$$
+
 - **High CPU Time + High Cycles**: Genuine compute-bound activity (heavy computational loops, algorithm execution).
 - **High CPU Time + Low Cycles**: Resource contention, hypervisor steal time (in virtual machines / cloud instances), lock contention (spin-lock starvation), or interrupt storms where scheduler time is billed without physical execution cycles.
 
