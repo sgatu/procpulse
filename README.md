@@ -121,7 +121,6 @@ make check     # Fast syntax and type checking without code generation
 make clean     # Remove build artifacts (target/)
 make run       # Run procpulse in debug mode
 ```
-```
 
 ---
 
@@ -132,7 +131,7 @@ make run       # Run procpulse in debug mode
 2. **`procpulse.ini`** (automatically loaded if present in the same directory as `procpulse.exe`; `procmon.ini` supported as fallback).
 3. **Internal defaults** (lowest priority).
 
-### `procpulse.ini`
+### `procpulse.ini` <a id="procpulseini"></a><a id="procpulse-ini"></a>
 
 A template is provided as [`procpulse.ini.example`](file:///C:/Users/Bacon/RustroverProjects/procmon/procpulse.ini.example). To use it:
 1. Copy or rename `procpulse.ini.example` to `procpulse.ini` (remove the `.example` extension).
