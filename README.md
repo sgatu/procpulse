@@ -6,6 +6,30 @@ An ultra-lightweight, continuous Windows process and system telemetry agent writ
 
 ---
 
+## Table of Contents
+
+1. [Key Features](#key-features)
+2. [Win32 Security & Permission Model](#win32-security--permission-model)
+3. [Building & Testing](#building--testing)
+   - 3.1. [Prerequisites](#prerequisites)
+   - 3.2. [Using Cargo](#using-cargo)
+   - 3.3. [Using Make](#using-make)
+4. [Configuration](#configuration)
+   - 4.1. [`procpulse.ini`](#procpulseini)
+   - 4.2. [Command-Line Arguments](#command-line-arguments)
+5. [CSV Output Schema](#csv-output-schema)
+   - 5.1. [CPU Measurement Math & Diagnostics](#cpu-measurement-math--diagnostics)
+     - 5.1.1. [Monotonic Timing & Skew Immunity](#monotonic-timing--skew-immunity)
+     - 5.1.2. [Diagnosing Performance: Cycles vs. CPU Time](#diagnosing-performance-cycles-vs-cpu-time)
+6. [Running as a Windows Service](#running-as-a-windows-service)
+   - 6.1. [Option 1: NSSM (Recommended for Simplicity)](#option-1-nssm-recommended-for-simplicity)
+   - 6.2. [Option 2: WinSW (Windows Service Wrapper - XML Config)](#option-2-winsw-windows-service-wrapper---xml-config)
+   - 6.3. [Verifying Service Operation](#verifying-service-operation)
+7. [Grafana & Alloy Telemetry Pipeline](#grafana--alloy-telemetry-pipeline)
+8. [License](#license)
+
+---
+
 ## Key Features
 
 - **Pure Win32 Architecture**: Built exclusively with raw Windows APIs via `windows-sys`. Zero runtime frameworks, zero C runtime dependencies, zero dynamic allocations during sampling loops.
