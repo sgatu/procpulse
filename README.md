@@ -21,6 +21,7 @@ An ultra-lightweight, continuous Windows process and system telemetry agent writ
    - 5.1. [CPU Measurement Math & Diagnostics](#cpu-measurement-math--diagnostics)
      - 5.1.1. [Monotonic Timing & Skew Immunity](#monotonic-timing--skew-immunity)
      - 5.1.2. [Diagnosing Performance: Cycles vs. CPU Time](#diagnosing-performance-cycles-vs-cpu-time)
+   - 5.2. [Network Telemetry & Loopback Filtering](#network-telemetry--loopback-filtering)
 6. [Running as a Windows Service](#running-as-a-windows-service)
    - 6.1. [Option 1: NSSM (Recommended for Simplicity)](#option-1-nssm-recommended-for-simplicity)
    - 6.2. [Option 2: WinSW (Windows Service Wrapper - XML Config)](#option-2-winsw-windows-service-wrapper---xml-config)
@@ -53,6 +54,13 @@ An ultra-lightweight, continuous Windows process and system telemetry agent writ
   - **Working Set RAM** (`WorkingSetSize`): Total resident memory.
   - **Private Committed Bytes** (`PagefileUsage`): Dedicated virtual memory allocation.
   - **Active Private RAM** (`PrivateWorkingSet` via `PROCESS_MEMORY_COUNTERS_EX2`): Resident physical private memory matching Task Manager's "Processes" tab Memory column.
+- **Per-Process Network I/O Telemetry (ETW)**:
+  - Real-time kernel network event consumption (`Microsoft-Windows-Kernel-Network`) tracking bytes transferred per flush window.
+  - **`app_net_rx_bytes`**: Cumulative payload bytes received over TCP/UDP (IPv4 and IPv6).
+  - **`app_net_tx_bytes`**: Cumulative payload bytes transmitted over TCP/UDP (IPv4 and IPv6).
+  - **Loopback Traffic Filtering**: Automatically ignores internal localhost/loopback communications (`127.0.0.0/8`, `::1`, `::ffff:127.x.x.x`).
+  - **Zero Sampling Interference**: Asynchronous lock-free atomic accumulation in cache-line aligned slots; zero locking or jitter on the 2-second CPU/memory polling cadence.
+  - **Driverless Pure Win32**: No Npcap, WinPcap, or WFP filtering drivers required.
 - **Dynamic Process Lifecycle & Argument Isolation**:
   - Periodically scans for newly spawned or restarted instances.
   - Extracts and normalizes command-line arguments (`NtQueryInformationProcess`) to track distinct roles (e.g. `--server alpha` vs `--server beta`) under identical executable names.
@@ -80,12 +88,14 @@ An ultra-lightweight, continuous Windows process and system telemetry agent writ
 | **CPU Time Tracking** | `GetProcessTimes` | `PROCESS_QUERY_LIMITED_INFORMATION` | Cumulative user and kernel runtime `FILETIME` counters. |
 | **CPU Cycle Tracking** | `QueryProcessCycleTime` | `PROCESS_QUERY_LIMITED_INFORMATION` | Hardware cycle counter queried via the existing process handle without additional handle allocations. |
 | **Memory Tracking** | `K32GetProcessMemoryInfo` | `PROCESS_QUERY_LIMITED_INFORMATION` | Queries `PROCESS_MEMORY_COUNTERS_EX2` for resident Working Set, Private Bytes, and active Private Working Set. |
+| **Network Telemetry (ETW)** | `StartTraceW`, `EnableTraceEx2`, `OpenTraceW`, `ProcessTrace` | Administrator (`SeSystemProfilePrivilege`) | Consumes real-time kernel network transfer events from `Microsoft-Windows-Kernel-Network`. Gracefully degrades to reporting 0 bytes with an informative log warning when running without Administrator privileges. |
 | **Host Machine Load** | `GetSystemTimes` & `GlobalMemoryStatusEx` | Standard user token | Whole-machine CPU idle/kernel/user times and physical RAM availability. |
 | **Graceful Exit** | `SetConsoleCtrlHandler` | Standard user token | Captures console close, logoff, and shutdown events to flush pending records. |
 
 > [!NOTE]
-> All per-process monitoring operations require solely `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE`—the lowest privilege level possible on Windows.
-> `procpulse` requires **no kernel drivers**, **no DLL injection**, **no memory scraping (`PROCESS_VM_READ`)**, and **no invasive hooks**.
+> All core process sampling operations (CPU, memory, cycles) require solely `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE`—the lowest privilege level possible on Windows.
+> Network telemetry uses private Event Tracing for Windows (ETW) and requires Administrator rights (`SeSystemProfilePrivilege`).
+> `procpulse` requires **no third-party packet capture drivers (Npcap/WinPcap)**, **no WFP drivers**, **no kernel drivers**, **no DLL injection**, and **no memory scraping (`PROCESS_VM_READ`)**.
 
 ---
 
@@ -188,7 +198,7 @@ procpulse.exe worker-*.exe C:\logs\metrics.csv
 `procpulse` outputs an RFC 4180 compliant CSV row for each tracked process at every aggregation flush (default: every 60 seconds).
 
 ```csv
-timestamp,executable,args,pid,app_cpu_avg,app_cpu_peak,app_cpu_cycles,app_cpu_time_ms,app_ram_mb_avg,app_ram_mb_peak,app_priv_ram_mb_avg,app_priv_ram_mb_peak,app_priv_active_mb_avg,app_priv_active_mb_peak,system_cpu_avg,system_cpu_peak,system_ram_mb_avg,system_ram_mb_peak,samples
+timestamp,executable,args,pid,app_cpu_avg,app_cpu_peak,app_cpu_cycles,app_cpu_time_ms,app_ram_mb_avg,app_ram_mb_peak,app_priv_ram_mb_avg,app_priv_ram_mb_peak,app_priv_active_mb_avg,app_priv_active_mb_peak,app_net_rx_bytes,app_net_tx_bytes,system_cpu_avg,system_cpu_peak,system_ram_mb_avg,system_ram_mb_peak,samples
 ```
 
 | # | Column | Type | Units | Description |
@@ -207,11 +217,13 @@ timestamp,executable,args,pid,app_cpu_avg,app_cpu_peak,app_cpu_cycles,app_cpu_ti
 | 12 | `app_priv_ram_mb_peak` | Float (`f64`) | MB | Peak total private committed memory (`PeakPagefileUsage`). |
 | 13 | `app_priv_active_mb_avg` | Float (`f64`) | MB | Average active private memory in physical RAM (`PrivateWorkingSet` / Task Manager "Memory"). |
 | 14 | `app_priv_active_mb_peak` | Float (`f64`) | MB | Peak active private memory in physical RAM. |
-| 15 | `system_cpu_avg` | Float (`f64`) | % | Average whole-machine system CPU load (`GetSystemTimes`). |
-| 16 | `system_cpu_peak` | Float (`f64`) | % | Peak single-sample whole-machine system CPU load. |
-| 17 | `system_ram_mb_avg` | Float (`f64`) | MB | Average system-wide physical RAM used (`GlobalMemoryStatusEx`). |
-| 18 | `system_ram_mb_peak` | Float (`f64`) | MB | Peak system-wide physical RAM used. |
-| 19 | `samples` | Integer (`u32`) | Count | Number of discrete sampling ticks accumulated in this flush window. |
+| 15 | `app_net_rx_bytes` | Integer (`u64`) | Bytes | Total network payload bytes received during the window across TCP/UDP (IPv4 & IPv6, excluding loopback). |
+| 16 | `app_net_tx_bytes` | Integer (`u64`) | Bytes | Total network payload bytes transmitted during the window across TCP/UDP (IPv4 & IPv6, excluding loopback). |
+| 17 | `system_cpu_avg` | Float (`f64`) | % | Average whole-machine system CPU load (`GetSystemTimes`). |
+| 18 | `system_cpu_peak` | Float (`f64`) | % | Peak single-sample whole-machine system CPU load. |
+| 19 | `system_ram_mb_avg` | Float (`f64`) | MB | Average system-wide physical RAM used (`GlobalMemoryStatusEx`). |
+| 20 | `system_ram_mb_peak` | Float (`f64`) | MB | Peak system-wide physical RAM used. |
+| 21 | `samples` | Integer (`u32`) | Count | Number of discrete sampling ticks accumulated in this flush window. |
 
 ### CPU Measurement Math & Diagnostics
 
@@ -235,6 +247,28 @@ $$\text{Cycles / CPU Second} = \frac{\text{app CPU cycles}}{\text{app CPU time (
 
 - **High CPU Time + High Cycles**: Genuine compute-bound activity (heavy computational loops, algorithm execution).
 - **High CPU Time + Low Cycles**: Resource contention, hypervisor steal time (in virtual machines / cloud instances), lock contention (spin-lock starvation), or interrupt storms where scheduler time is billed without physical execution cycles.
+
+### Network Telemetry & Loopback Filtering
+
+`procpulse` measures true per-process network payload volume using a real-time private Event Tracing for Windows (ETW) kernel session on `Microsoft-Windows-Kernel-Network` (`{7dd42a49-5329-4832-8dfd-43d979153a88}`).
+
+#### Key Architectural Highlights
+- **Supported Protocols**: Monitors TCPv4, TCPv6, UDPv4, and UDPv6 kernel send and receive events:
+  - TCPv4 Send (ID 10) & Receive (ID 11)
+  - TCPv6 Send (ID 26) & Receive (ID 27)
+  - UDPv4 Send (ID 42) & Receive (ID 43)
+  - UDPv6 Send (ID 58) & Receive (ID 59)
+- **Loopback Traffic Exclusion**:
+  Automatically filters out internal loopback communications on both source and destination addresses to ensure metrics reflect real network I/O:
+  - IPv4: `127.0.0.0/8`
+  - IPv6: `::1` (native loopback)
+  - IPv4-Mapped IPv6: `::ffff:127.0.0.0/104`
+- **Zero-Interference Hot Path**:
+  Network bytes accumulate asynchronously via lock-free atomic counters (`AtomicU64`) allocated in dedicated cache-line aligned slots. The main 2-second CPU/RAM polling loop is never blocked or contended.
+- **Direct Window Draining**:
+  At each aggregation flush (e.g. 60 seconds), the atomic counters are drained (`swap(0, Ordering::AcqRel)`) directly into the emitted CSV record.
+- **Graceful Fallback**:
+  ETW kernel tracing requires Windows Administrator privileges (`SeSystemProfilePrivilege`). When running under a standard user account, `procpulse` outputs an informative warning and cleanly defaults network counters to `0`, while CPU, memory, and cycle monitoring continue operating normally without interruption.
 
 ---
 
@@ -392,11 +426,12 @@ Open an **Administrator PowerShell**:
 
 1. **Telemetry Ingestion**:
    - Uses `loki.source.file` to tail the output CSV (`procpulse_metrics.csv`).
-   - Extracts all 19 columns with regex into named fields.
-   - Exposes Prometheus gauges: `procpulse_app_cpu_percent`, `procpulse_app_cpu_cycles`, `procpulse_app_cpu_time_ms`, `procpulse_app_priv_active_mb`, `procpulse_app_ram_ws_mb`, `procpulse_system_cpu_percent`, `procpulse_system_ram_used_mb`.
+   - Extracts all 21 columns with regex into named fields.
+   - Exposes Prometheus gauges: `procpulse_app_cpu_percent`, `procpulse_app_cpu_cycles`, `procpulse_app_cpu_time_ms`, `procpulse_app_priv_active_mb`, `procpulse_app_ram_ws_mb`, `procpulse_app_net_rx_bytes`, `procpulse_app_net_tx_bytes`, `procpulse_system_cpu_percent`, `procpulse_system_ram_used_mb`.
    - Attaches labels for `executable`, `args`, and `machine` hostname.
 2. **Dashboard Visualizations**:
-   - Visualizes Application Memory, CPU %, Cycles, and the derived `Cycles / CPU Sec` ratio.
+   - Includes a production-ready Grafana dashboard definition in [`dashboard.json`](dashboard.json).
+   - Visualizes Application Memory, CPU %, Cycles, the derived `Cycles / CPU Sec` ratio, whole-machine load, real-time Network Traffic (`app_net_rx_bytes` & `app_net_tx_bytes`), and Total Network Volume over the selected time range.
 
 ---
 
