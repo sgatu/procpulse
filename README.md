@@ -143,7 +143,7 @@ make run       # Run procpulse in debug mode
 
 ### `procpulse.ini` <a id="procpulseini"></a><a id="procpulse-ini"></a>
 
-A template is provided as [`procpulse.ini.example`](file:///C:/Users/Bacon/RustroverProjects/procmon/procpulse.ini.example). To use it:
+A template is provided as [`procpulse.ini.example`](procpulse.ini.example). To use it:
 1. Copy or rename `procpulse.ini.example` to `procpulse.ini` (remove the `.example` extension).
 2. Place `procpulse.ini` in the same directory as `procpulse.exe`.
 
