@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::{wildcard_match, Config};
@@ -8,7 +9,7 @@ use crate::win32::{
     self, extract_arguments, get_process_command_line, get_process_cycle_time,
     get_process_full_path, get_process_memory, get_process_times, get_system_memory,
     get_system_time_utc_string, get_system_times, is_process_alive, open_process_for_monitoring,
-    SafeHandle, SystemTimes,
+    EtwNetworkSession, SafeHandle, SharedNetState, SystemTimes,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -186,6 +187,7 @@ pub struct TrackedInstance {
     pub prev_cycle_count: Option<u64>,
     pub cycle_warned: bool,
     pub accumulator: MetricAccumulator,
+    pub net_slot_idx: Option<usize>,
 }
 
 pub struct ProcessMonitor {
@@ -198,6 +200,8 @@ pub struct ProcessMonitor {
     last_flush_instant: Instant,
     writer: CsvWriter,
     logical_cores: u32,
+    shared_net: Arc<SharedNetState>,
+    etw_session: Option<EtwNetworkSession>,
 }
 
 impl ProcessMonitor {
@@ -212,6 +216,27 @@ impl ProcessMonitor {
             .map(|n| n.get() as u32)
             .unwrap_or(1);
 
+        let shared_net = Arc::new(SharedNetState::new());
+        let etw_session = match EtwNetworkSession::start(shared_net.clone()) {
+            Ok(session) => {
+                eprintln!("[INFO] ETW network tracing active (Microsoft-Windows-Kernel-Network).");
+                Some(session)
+            }
+            Err(err) => {
+                if err == 5 {
+                    eprintln!(
+                        "[WARN] Network telemetry unavailable: Administrator privileges required for ETW kernel network tracing. Network metrics will report 0."
+                    );
+                } else {
+                    eprintln!(
+                        "[WARN] Failed to start ETW network tracing session (error code {}). Network metrics will report 0.",
+                        err
+                    );
+                }
+                None
+            }
+        };
+
         Ok(Self {
             config,
             tracked: HashMap::with_capacity(16),
@@ -222,6 +247,8 @@ impl ProcessMonitor {
             last_flush_instant: Instant::now(),
             writer,
             logical_cores,
+            shared_net,
+            etw_session,
         })
     }
 
@@ -310,6 +337,8 @@ impl ProcessMonitor {
                         entry.pid, entry.exe_name, args
                     );
 
+                    let net_slot_idx = self.shared_net.claim_slot(entry.pid);
+
                     self.tracked.insert(
                         entry.pid,
                         TrackedInstance {
@@ -322,6 +351,7 @@ impl ProcessMonitor {
                             prev_cycle_count: None,
                             cycle_warned: false,
                             accumulator: MetricAccumulator::new(),
+                            net_slot_idx,
                         },
                     );
                     self.warned_pids.remove(&entry.pid);
@@ -360,8 +390,14 @@ impl ProcessMonitor {
 
             for pid in exited_pids {
                 if let Some(instance) = self.tracked.remove(&pid) {
-                    // If we accumulated any valid samples before it exited, write partial aggregate
-                    if instance.accumulator.sample_count > 0 {
+                    // Release slot immediately so ETW stops accumulating to this PID
+                    let (rx_bytes, tx_bytes) = match instance.net_slot_idx {
+                        Some(idx) => self.shared_net.release_slot(idx),
+                        None => (0, 0),
+                    };
+
+                    // If we accumulated any valid samples or network bytes before it exited, write partial aggregate
+                    if instance.accumulator.sample_count > 0 || rx_bytes > 0 || tx_bytes > 0 {
                         let (cpu_avg, ws_avg, priv_avg, priv_active_avg) = instance.accumulator.averages();
                         let record = CsvRecord {
                             timestamp: &timestamp,
@@ -378,6 +414,8 @@ impl ProcessMonitor {
                             app_priv_ram_peak_mb: instance.accumulator.ram_priv_peak_mb,
                             app_priv_active_avg_mb: priv_active_avg,
                             app_priv_active_peak_mb: instance.accumulator.ram_priv_active_peak_mb,
+                            app_net_rx_bytes: rx_bytes,
+                            app_net_tx_bytes: tx_bytes,
                             system_cpu_avg: sys_cpu_avg,
                             system_cpu_peak: self.system_accumulator.cpu_peak,
                             system_ram_avg_mb: sys_ram_avg,
@@ -392,8 +430,8 @@ impl ProcessMonitor {
                         }
 
                         eprintln!(
-                            "[INFO] Process PID {} exited mid-window. Flushed {} partial samples.",
-                            pid, instance.accumulator.sample_count
+                            "[INFO] Process PID {} exited mid-window. Flushed {} partial samples (net: {} RX, {} TX bytes).",
+                            pid, instance.accumulator.sample_count, rx_bytes, tx_bytes
                         );
                     } else {
                         eprintln!("[INFO] Process PID {} exited without recorded samples.", pid);
@@ -510,7 +548,12 @@ impl ProcessMonitor {
         let (sys_cpu_avg, sys_ram_avg) = self.system_accumulator.averages();
 
         for instance in self.tracked.values_mut() {
-            if instance.accumulator.sample_count == 0 {
+            let (rx_bytes, tx_bytes) = match instance.net_slot_idx {
+                Some(idx) => self.shared_net.drain_slot(idx),
+                None => (0, 0),
+            };
+
+            if instance.accumulator.sample_count == 0 && rx_bytes == 0 && tx_bytes == 0 {
                 continue;
             }
 
@@ -530,6 +573,8 @@ impl ProcessMonitor {
                 app_priv_ram_peak_mb: instance.accumulator.ram_priv_peak_mb,
                 app_priv_active_avg_mb: priv_active_avg,
                 app_priv_active_peak_mb: instance.accumulator.ram_priv_active_peak_mb,
+                app_net_rx_bytes: rx_bytes,
+                app_net_tx_bytes: tx_bytes,
                 system_cpu_avg: sys_cpu_avg,
                 system_cpu_peak: self.system_accumulator.cpu_peak,
                 system_ram_avg_mb: sys_ram_avg,
@@ -552,6 +597,9 @@ impl ProcessMonitor {
     pub fn shutdown_flush(&mut self) {
         eprintln!("[INFO] Graceful shutdown requested. Flushing pending measurements...");
         self.flush_aggregates();
+        if let Some(mut session) = self.etw_session.take() {
+            session.shutdown();
+        }
     }
 }
 
@@ -952,5 +1000,54 @@ mod tests {
         assert_eq!(accumulator.cpu_time_100ns_total, 50_000);
         assert_eq!(accumulator.cpu_time_ms(), 5);
         assert_eq!(accumulator.app_cpu_time_ms(), 5);
+    }
+
+    #[test]
+    fn test_network_slot_drained_at_flush() {
+        let shared_net = SharedNetState::new();
+        let slot = shared_net.claim_slot(5000).expect("claim");
+
+        // Simulate traffic during 60s aggregation window
+        shared_net.record_traffic(5000, 2_048_000, 1_024_000);
+
+        let (rx, tx) = shared_net.drain_slot(slot);
+        assert_eq!(rx, 2_048_000);
+        assert_eq!(tx, 1_024_000);
+
+        // Next flush has 0 bytes unless new traffic arrived
+        let (rx2, tx2) = shared_net.drain_slot(slot);
+        assert_eq!(rx2, 0);
+        assert_eq!(tx2, 0);
+    }
+
+    #[test]
+    fn test_network_slot_released_at_exit_with_zero_cpu_samples() {
+        let shared_net = SharedNetState::new();
+        let slot = shared_net.claim_slot(6000).expect("claim");
+
+        // Fast process: did network I/O but had 0 CPU samples before exiting
+        shared_net.record_traffic(6000, 500_000, 100_000);
+
+        let (rx, tx) = shared_net.release_slot(slot);
+        assert_eq!(rx, 500_000);
+        assert_eq!(tx, 100_000);
+
+        // Slot is freed and PID is 0
+        assert_eq!(shared_net.slots[slot].pid.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_network_reused_pid_starts_at_zero() {
+        let shared_net = SharedNetState::new();
+        // PID 7000 runs, transfers data, exits
+        let slot = shared_net.claim_slot(7000).expect("claim");
+        shared_net.record_traffic(7000, 10_000, 20_000);
+        let _ = shared_net.release_slot(slot);
+
+        // Later, Windows reuses PID 7000 for a new process
+        let new_slot = shared_net.claim_slot(7000).expect("claim reused");
+        let (rx, tx) = shared_net.drain_slot(new_slot);
+        assert_eq!(rx, 0);
+        assert_eq!(tx, 0);
     }
 }

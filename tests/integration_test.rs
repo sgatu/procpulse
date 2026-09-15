@@ -91,7 +91,7 @@ fn test_end_to_end_monitoring() {
     // Check Header
     assert_eq!(
         lines[0],
-        "timestamp,executable,args,pid,app_cpu_avg,app_cpu_peak,app_cpu_cycles,app_cpu_time_ms,app_ram_mb_avg,app_ram_mb_peak,app_priv_ram_mb_avg,app_priv_ram_mb_peak,app_priv_active_mb_avg,app_priv_active_mb_peak,system_cpu_avg,system_cpu_peak,system_ram_mb_avg,system_ram_mb_peak,samples"
+        "timestamp,executable,args,pid,app_cpu_avg,app_cpu_peak,app_cpu_cycles,app_cpu_time_ms,app_ram_mb_avg,app_ram_mb_peak,app_priv_ram_mb_avg,app_priv_ram_mb_peak,app_priv_active_mb_avg,app_priv_active_mb_peak,app_net_rx_bytes,app_net_tx_bytes,system_cpu_avg,system_cpu_peak,system_ram_mb_avg,system_ram_mb_peak,samples"
     );
 
     // Verify presence of monitored instances

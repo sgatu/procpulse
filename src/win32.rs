@@ -9,6 +9,7 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
+use windows_sys::Win32::System::Diagnostics::Etw::*;
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
 };
@@ -487,6 +488,366 @@ pub fn enumerate_processes() -> Vec<ProcessSnapshotEntry> {
     results
 }
 
+pub const MAX_TRACKED_SLOTS: usize = 32;
+
+pub const KERNEL_NETWORK_PROVIDER_GUID: windows_sys::core::GUID = windows_sys::core::GUID {
+    data1: 0x7dd42a49,
+    data2: 0x5329,
+    data3: 0x4832,
+    data4: [0x8d, 0xfd, 0x43, 0xd9, 0x79, 0x15, 0x3a, 0x88],
+};
+
+#[repr(C, align(64))]
+pub struct NetCounterSlot {
+    pub pid: std::sync::atomic::AtomicU32,
+    pub rx_bytes: std::sync::atomic::AtomicU64,
+    pub tx_bytes: std::sync::atomic::AtomicU64,
+}
+
+impl Default for NetCounterSlot {
+    fn default() -> Self {
+        Self {
+            pid: std::sync::atomic::AtomicU32::new(0),
+            rx_bytes: std::sync::atomic::AtomicU64::new(0),
+            tx_bytes: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+pub struct SharedNetState {
+    pub slots: [NetCounterSlot; MAX_TRACKED_SLOTS],
+}
+
+impl Default for SharedNetState {
+    fn default() -> Self {
+        const INIT_SLOT: NetCounterSlot = NetCounterSlot {
+            pid: std::sync::atomic::AtomicU32::new(0),
+            rx_bytes: std::sync::atomic::AtomicU64::new(0),
+            tx_bytes: std::sync::atomic::AtomicU64::new(0),
+        };
+        Self {
+            slots: [INIT_SLOT; MAX_TRACKED_SLOTS],
+        }
+    }
+}
+
+impl SharedNetState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn claim_slot(&self, pid: u32) -> Option<usize> {
+        if pid == 0 {
+            return None;
+        }
+        // If already claimed for this PID, return existing slot
+        for (i, slot) in self.slots.iter().enumerate() {
+            if slot.pid.load(std::sync::atomic::Ordering::Relaxed) == pid {
+                return Some(i);
+            }
+        }
+        // Find first free slot (pid == 0)
+        for (i, slot) in self.slots.iter().enumerate() {
+            if slot.pid.compare_exchange(
+                0,
+                pid,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            ).is_ok() {
+                slot.rx_bytes.store(0, std::sync::atomic::Ordering::Release);
+                slot.tx_bytes.store(0, std::sync::atomic::Ordering::Release);
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    pub fn drain_slot(&self, slot_idx: usize) -> (u64, u64) {
+        if slot_idx >= MAX_TRACKED_SLOTS {
+            return (0, 0);
+        }
+        let slot = &self.slots[slot_idx];
+        let rx = slot.rx_bytes.swap(0, std::sync::atomic::Ordering::AcqRel);
+        let tx = slot.tx_bytes.swap(0, std::sync::atomic::Ordering::AcqRel);
+        (rx, tx)
+    }
+
+    pub fn release_slot(&self, slot_idx: usize) -> (u64, u64) {
+        if slot_idx >= MAX_TRACKED_SLOTS {
+            return (0, 0);
+        }
+        let slot = &self.slots[slot_idx];
+        let rx = slot.rx_bytes.swap(0, std::sync::atomic::Ordering::AcqRel);
+        let tx = slot.tx_bytes.swap(0, std::sync::atomic::Ordering::AcqRel);
+        slot.pid.store(0, std::sync::atomic::Ordering::Release);
+        (rx, tx)
+    }
+
+    #[inline]
+    pub fn record_traffic(&self, pid: u32, rx_delta: u64, tx_delta: u64) {
+        if pid == 0 || (rx_delta == 0 && tx_delta == 0) {
+            return;
+        }
+        for slot in &self.slots {
+            if slot.pid.load(std::sync::atomic::Ordering::Relaxed) == pid {
+                if rx_delta > 0 {
+                    slot.rx_bytes.fetch_add(rx_delta, std::sync::atomic::Ordering::Relaxed);
+                }
+                if tx_delta > 0 {
+                    slot.tx_bytes.fetch_add(tx_delta, std::sync::atomic::Ordering::Relaxed);
+                }
+                return;
+            }
+        }
+    }
+}
+
+pub fn str_to_utf16_null(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn create_trace_properties_buf(session_name_u16: &[u16]) -> Vec<u8> {
+    let name_bytes = session_name_u16.len() * std::mem::size_of::<u16>();
+    let total_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + name_bytes + 256;
+    let mut buf = vec![0u8; total_size];
+    unsafe {
+        let props = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
+        (*props).Wnode.BufferSize = total_size as u32;
+        (*props).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        (*props).Wnode.ClientContext = 1; // QPC
+        (*props).LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+        (*props).BufferSize = 64; // 64 KB buffers
+        (*props).MinimumBuffers = 4;
+        (*props).MaximumBuffers = 16;
+        (*props).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+        (*props).LogFileNameOffset = 0;
+    }
+    buf
+}
+
+pub fn stop_session_by_name(session_name_u16: &[u16]) {
+    let mut buf = create_trace_properties_buf(session_name_u16);
+    unsafe {
+        ControlTraceW(
+            CONTROLTRACE_HANDLE { Value: 0 },
+            session_name_u16.as_ptr(),
+            buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES,
+            EVENT_TRACE_CONTROL_STOP,
+        );
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct KernelNetIpv4Prefix {
+    pub pid: u32,
+    pub size: u32,
+    pub daddr: [u8; 4],
+    pub saddr: [u8; 4],
+    pub dport: u16,
+    pub sport: u16,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct KernelNetIpv6Prefix {
+    pub pid: u32,
+    pub size: u32,
+    pub daddr: [u8; 16],
+    pub saddr: [u8; 16],
+    pub dport: u16,
+    pub sport: u16,
+}
+
+#[inline]
+pub fn is_ipv6_loopback(addr: &[u8]) -> bool {
+    const IPV6_LOOPBACK: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    if addr == IPV6_LOOPBACK {
+        return true;
+    }
+    // Check IPv4-mapped IPv6 loopback: ::ffff:127.x.x.x
+    const IPV4_MAPPED_PREFIX: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
+    if addr.starts_with(&IPV4_MAPPED_PREFIX) && addr[12] == 127 {
+        return true;
+    }
+    false
+}
+
+#[inline]
+pub fn is_loopback(event_id: u16, user_data: *const u8, data_len: usize) -> bool {
+    match event_id {
+        // IPv4 events: 10 (TCP send), 11 (TCP recv), 42 (UDP send), 43 (UDP recv)
+        10 | 11 | 42 | 43 => {
+            if data_len < std::mem::size_of::<KernelNetIpv4Prefix>() {
+                return false;
+            }
+            let hdr = unsafe { std::ptr::read_unaligned(user_data as *const KernelNetIpv4Prefix) };
+            hdr.daddr[0] == 127 || hdr.saddr[0] == 127
+        }
+        // IPv6 events: 26 (TCP send), 27 (TCP recv), 58 (UDP send), 59 (UDP recv)
+        26 | 27 | 58 | 59 => {
+            if data_len < std::mem::size_of::<KernelNetIpv6Prefix>() {
+                return false;
+            }
+            let hdr = unsafe { std::ptr::read_unaligned(user_data as *const KernelNetIpv6Prefix) };
+            is_ipv6_loopback(&hdr.daddr) || is_ipv6_loopback(&hdr.saddr)
+        }
+        _ => false,
+    }
+}
+
+unsafe extern "system" fn etw_event_record_callback(event_record: *mut EVENT_RECORD) {
+    if event_record.is_null() {
+        return;
+    }
+    let record = unsafe { &*event_record };
+
+    // Validate schema version: Microsoft-Windows-Kernel-Network publishes Version 0.
+    // If an unknown future schema version is encountered, ignore it safely.
+    if record.EventHeader.EventDescriptor.Version != 0 {
+        return;
+    }
+
+    let event_id = record.EventHeader.EventDescriptor.Id;
+
+    // Send: 10 (TCPv4), 26 (TCPv6), 42 (UDPv4), 58 (UDPv6)
+    // Recv: 11 (TCPv4), 27 (TCPv6), 43 (UDPv4), 59 (UDPv6)
+    let is_send = match event_id {
+        10 | 26 | 42 | 58 => true,
+        11 | 27 | 43 | 59 => false,
+        _ => return,
+    };
+
+    let user_data = record.UserData as *const u8;
+    let data_len = record.UserDataLength as usize;
+
+    if user_data.is_null() || data_len < 8 {
+        return;
+    }
+
+    // Ignore loopback traffic (127.0.0.0/8, ::1, ::ffff:127.x.x.x)
+    if is_loopback(event_id, user_data, data_len) {
+        return;
+    }
+
+    let pid = unsafe { std::ptr::read_unaligned(user_data as *const u32) };
+    let size = unsafe { std::ptr::read_unaligned(user_data.add(4) as *const u32) as u64 };
+
+    if record.UserContext.is_null() {
+        return;
+    }
+    let shared_net = unsafe { &*(record.UserContext as *const SharedNetState) };
+    if is_send {
+        shared_net.record_traffic(pid, 0, size);
+    } else {
+        shared_net.record_traffic(pid, size, 0);
+    }
+}
+
+pub struct EtwNetworkSession {
+    session_name_u16: Vec<u16>,
+    trace_handle: PROCESSTRACE_HANDLE,
+    worker_thread: Option<std::thread::JoinHandle<()>>,
+    #[allow(dead_code)]
+    shared_net: std::sync::Arc<SharedNetState>,
+}
+
+impl EtwNetworkSession {
+    pub fn start(shared_net: std::sync::Arc<SharedNetState>) -> Result<Self, u32> {
+        let session_name = format!("procpulse_net_{}", std::process::id());
+        let session_name_u16 = str_to_utf16_null(&session_name);
+
+        // Stop any leftover session with this name first
+        stop_session_by_name(&session_name_u16);
+
+        let mut buf = create_trace_properties_buf(&session_name_u16);
+        let mut session_handle = CONTROLTRACE_HANDLE { Value: 0 };
+
+        let status = unsafe {
+            StartTraceW(
+                &mut session_handle,
+                session_name_u16.as_ptr(),
+                buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES,
+            )
+        };
+
+        if status != 0 {
+            return Err(status);
+        }
+
+        // Enable Microsoft-Windows-Kernel-Network provider
+        // Keywords: 0x10 (IPv4) | 0x20 (IPv6) = 0x30
+        // Level: 4 (TRACE_LEVEL_INFORMATION)
+        let enable_status = unsafe {
+            EnableTraceEx2(
+                session_handle,
+                &KERNEL_NETWORK_PROVIDER_GUID,
+                EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                4,
+                0x30,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        };
+
+        if enable_status != 0 {
+            stop_session_by_name(&session_name_u16);
+            return Err(enable_status);
+        }
+
+        let mut logfile: EVENT_TRACE_LOGFILEW = unsafe { std::mem::zeroed() };
+        logfile.LoggerName = session_name_u16.as_ptr() as *mut u16;
+        logfile.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+        logfile.Anonymous2.EventRecordCallback = Some(etw_event_record_callback);
+        logfile.Context = &*shared_net as *const SharedNetState as *mut c_void;
+
+        let trace_handle = unsafe { OpenTraceW(&mut logfile) };
+        if trace_handle.Value == u64::MAX || trace_handle.Value == 0 {
+            let err = unsafe { GetLastError() };
+            stop_session_by_name(&session_name_u16);
+            return Err(if err != 0 { err } else { 1 });
+        }
+
+        let worker_handle = trace_handle;
+        let worker_thread = std::thread::Builder::new()
+            .name("procpulse-etw".to_string())
+            .spawn(move || {
+                let handle = worker_handle;
+                unsafe {
+                    ProcessTrace(&handle, 1, std::ptr::null(), std::ptr::null());
+                }
+            })
+            .ok();
+
+        Ok(Self {
+            session_name_u16,
+            trace_handle,
+            worker_thread,
+            shared_net,
+        })
+    }
+
+    pub fn shutdown(&mut self) {
+        if self.trace_handle.Value != u64::MAX && self.trace_handle.Value != 0 {
+            unsafe { CloseTrace(self.trace_handle) };
+            self.trace_handle = PROCESSTRACE_HANDLE { Value: 0 };
+        }
+
+        stop_session_by_name(&self.session_name_u16);
+
+        if let Some(handle) = self.worker_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for EtwNetworkSession {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,4 +887,132 @@ mod tests {
         assert!(s.ends_with('Z'));
         assert_eq!(&s[10..11], "T");
     }
+
+    #[test]
+    fn test_shared_net_state_claim_and_drain() {
+        let state = SharedNetState::new();
+        let slot = state.claim_slot(1234).expect("claim slot");
+        assert_eq!(state.drain_slot(slot), (0, 0));
+
+        state.record_traffic(1234, 1000, 500);
+        state.record_traffic(1234, 250, 750);
+
+        let (rx, tx) = state.drain_slot(slot);
+        assert_eq!(rx, 1250);
+        assert_eq!(tx, 1250);
+
+        // After drain, should be 0
+        assert_eq!(state.drain_slot(slot), (0, 0));
+    }
+
+    #[test]
+    fn test_shared_net_state_untracked_ignored() {
+        let state = SharedNetState::new();
+        let slot = state.claim_slot(1000).expect("claim slot");
+
+        // Traffic for PID 9999 (untracked)
+        state.record_traffic(9999, 5000, 2000);
+
+        // Tracked slot 1000 unaffected
+        assert_eq!(state.drain_slot(slot), (0, 0));
+    }
+
+    #[test]
+    fn test_shared_net_state_release_clears_pid() {
+        let state = SharedNetState::new();
+        let slot = state.claim_slot(2000).expect("claim slot");
+        state.record_traffic(2000, 400, 300);
+
+        let (rx, tx) = state.release_slot(slot);
+        assert_eq!(rx, 400);
+        assert_eq!(tx, 300);
+
+        // After release, slot pid is 0, future traffic to 2000 is ignored
+        state.record_traffic(2000, 100, 100);
+        assert_eq!(state.drain_slot(slot), (0, 0));
+    }
+
+    #[test]
+    fn test_shared_net_state_multiple_pids() {
+        let state = SharedNetState::new();
+        let slot1 = state.claim_slot(1001).expect("slot 1");
+        let slot2 = state.claim_slot(1002).expect("slot 2");
+
+        state.record_traffic(1001, 100, 200);
+        state.record_traffic(1002, 300, 400);
+
+        assert_eq!(state.drain_slot(slot1), (100, 200));
+        assert_eq!(state.drain_slot(slot2), (300, 400));
+    }
+
+    #[test]
+    fn test_shared_net_state_large_u64_preserves_precision() {
+        let state = SharedNetState::new();
+        let slot = state.claim_slot(3000).expect("claim slot");
+
+        let large_rx: u64 = 100_000_000_000;
+        let large_tx: u64 = 50_000_000_000;
+        state.record_traffic(3000, large_rx, large_tx);
+
+        assert_eq!(state.drain_slot(slot), (large_rx, large_tx));
+    }
+
+    #[test]
+    fn test_is_loopback_ipv4() {
+        // Layout: [pid: 4B, size: 4B, daddr: 4B, saddr: 4B, dport: 2B, sport: 2B, seq: 4B, connid: 4B] = 28 bytes
+        let mut buf_loopback = [0u8; 28];
+        buf_loopback[8] = 127; // daddr = 127.0.0.1
+        buf_loopback[11] = 1;
+        assert!(is_loopback(10, buf_loopback.as_ptr(), 28));
+        assert!(is_loopback(11, buf_loopback.as_ptr(), 28));
+
+        let mut buf_external = [0u8; 28];
+        buf_external[8] = 192; // daddr = 192.168.1.1
+        buf_external[9] = 168;
+        buf_external[12] = 10;  // saddr = 10.0.0.1
+        assert!(!is_loopback(10, buf_external.as_ptr(), 28));
+        assert!(!is_loopback(11, buf_external.as_ptr(), 28));
+        assert!(!is_loopback(42, buf_external.as_ptr(), 28));
+        assert!(!is_loopback(43, buf_external.as_ptr(), 28));
+    }
+
+    #[test]
+    fn test_is_loopback_ipv6() {
+        // Layout: [pid: 4B, size: 4B, daddr: 16B, saddr: 16B, dport: 2B, sport: 2B, seq: 4B, connid: 4B] = 52 bytes
+        let mut buf_loopback = [0u8; 52];
+        buf_loopback[23] = 1; // daddr = ::1
+        assert!(is_loopback(26, buf_loopback.as_ptr(), 52));
+        assert!(is_loopback(27, buf_loopback.as_ptr(), 52));
+        assert!(is_loopback(58, buf_loopback.as_ptr(), 52));
+        assert!(is_loopback(59, buf_loopback.as_ptr(), 52));
+
+        let mut buf_external = [0u8; 52];
+        buf_external[8] = 0x20; // 2001:db8::
+        buf_external[9] = 0x01;
+        assert!(!is_loopback(26, buf_external.as_ptr(), 52));
+        assert!(!is_loopback(27, buf_external.as_ptr(), 52));
+    }
+
+    #[test]
+    fn test_schema_offsets_match_manifest() {
+        use std::mem::offset_of;
+        // IPv4 layout matches manifest: PID(0), size(4), daddr(8), saddr(12), dport(16), sport(18)
+        assert_eq!(offset_of!(KernelNetIpv4Prefix, pid), 0);
+        assert_eq!(offset_of!(KernelNetIpv4Prefix, size), 4);
+        assert_eq!(offset_of!(KernelNetIpv4Prefix, daddr), 8);
+        assert_eq!(offset_of!(KernelNetIpv4Prefix, saddr), 12);
+        assert_eq!(offset_of!(KernelNetIpv4Prefix, dport), 16);
+        assert_eq!(offset_of!(KernelNetIpv4Prefix, sport), 18);
+        assert_eq!(std::mem::size_of::<KernelNetIpv4Prefix>(), 20);
+
+        // IPv6 layout matches manifest: PID(0), size(4), daddr(8), saddr(24), dport(40), sport(42)
+        assert_eq!(offset_of!(KernelNetIpv6Prefix, pid), 0);
+        assert_eq!(offset_of!(KernelNetIpv6Prefix, size), 4);
+        assert_eq!(offset_of!(KernelNetIpv6Prefix, daddr), 8);
+        assert_eq!(offset_of!(KernelNetIpv6Prefix, saddr), 24);
+        assert_eq!(offset_of!(KernelNetIpv6Prefix, dport), 40);
+        assert_eq!(offset_of!(KernelNetIpv6Prefix, sport), 42);
+        assert_eq!(std::mem::size_of::<KernelNetIpv6Prefix>(), 44);
+    }
 }
+

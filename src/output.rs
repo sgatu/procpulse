@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-pub const CSV_HEADER: &str = "timestamp,executable,args,pid,app_cpu_avg,app_cpu_peak,app_cpu_cycles,app_cpu_time_ms,app_ram_mb_avg,app_ram_mb_peak,app_priv_ram_mb_avg,app_priv_ram_mb_peak,app_priv_active_mb_avg,app_priv_active_mb_peak,system_cpu_avg,system_cpu_peak,system_ram_mb_avg,system_ram_mb_peak,samples\n";
+pub const CSV_HEADER: &str = "timestamp,executable,args,pid,app_cpu_avg,app_cpu_peak,app_cpu_cycles,app_cpu_time_ms,app_ram_mb_avg,app_ram_mb_peak,app_priv_ram_mb_avg,app_priv_ram_mb_peak,app_priv_active_mb_avg,app_priv_active_mb_peak,app_net_rx_bytes,app_net_tx_bytes,system_cpu_avg,system_cpu_peak,system_ram_mb_avg,system_ram_mb_peak,samples\n";
 
 /// Escapes a string for CSV according to RFC 4180.
 /// Encloses in double quotes if it contains commas, quotes, line breaks,
@@ -51,6 +51,8 @@ pub struct CsvRecord<'a> {
     pub app_priv_ram_peak_mb: f64,
     pub app_priv_active_avg_mb: f64,
     pub app_priv_active_peak_mb: f64,
+    pub app_net_rx_bytes: u64,
+    pub app_net_tx_bytes: u64,
     pub system_cpu_avg: f64,
     pub system_cpu_peak: f64,
     pub system_ram_avg_mb: f64,
@@ -61,7 +63,7 @@ pub struct CsvRecord<'a> {
 impl<'a> CsvRecord<'a> {
     pub fn format_row(&self) -> String {
         format!(
-            "{timestamp},{exe},{args},{pid},{app_cpu_avg:.3},{app_cpu_peak:.3},{app_cpu_cycles},{app_cpu_time_ms},{app_ws_avg:.1},{app_ws_peak:.1},{app_priv_avg:.1},{app_priv_peak:.1},{app_priv_act_avg:.1},{app_priv_act_peak:.1},{sys_cpu_avg:.2},{sys_cpu_peak:.2},{sys_ram_avg:.1},{sys_ram_peak:.1},{samples}\n",
+            "{timestamp},{exe},{args},{pid},{app_cpu_avg:.3},{app_cpu_peak:.3},{app_cpu_cycles},{app_cpu_time_ms},{app_ws_avg:.1},{app_ws_peak:.1},{app_priv_avg:.1},{app_priv_peak:.1},{app_priv_act_avg:.1},{app_priv_act_peak:.1},{app_net_rx},{app_net_tx},{sys_cpu_avg:.2},{sys_cpu_peak:.2},{sys_ram_avg:.1},{sys_ram_peak:.1},{samples}\n",
             timestamp = self.timestamp,
             exe = escape_csv_field(self.executable),
             args = escape_csv_field(self.args),
@@ -76,6 +78,8 @@ impl<'a> CsvRecord<'a> {
             app_priv_peak = self.app_priv_ram_peak_mb,
             app_priv_act_avg = self.app_priv_active_avg_mb,
             app_priv_act_peak = self.app_priv_active_peak_mb,
+            app_net_rx = self.app_net_rx_bytes,
+            app_net_tx = self.app_net_tx_bytes,
             sys_cpu_avg = self.system_cpu_avg,
             sys_cpu_peak = self.system_cpu_peak,
             sys_ram_avg = self.system_ram_avg_mb,
@@ -312,6 +316,8 @@ mod tests {
             app_priv_ram_peak_mb: 325.0,
             app_priv_active_avg_mb: 215.2,
             app_priv_active_peak_mb: 220.0,
+            app_net_rx_bytes: 1048576,
+            app_net_tx_bytes: 524288,
             system_cpu_avg: 18.72,
             system_cpu_peak: 37.20,
             system_ram_avg_mb: 10342.5,
@@ -322,7 +328,7 @@ mod tests {
         let row = record.format_row();
         assert_eq!(
             row,
-            "2026-09-10T17:15:00Z,MyApplication.exe,--server alpha --port 8001,4100,3.210,12.400,4500000000,1250,428.3,451.8,310.5,325.0,215.2,220.0,18.72,37.20,10342.5,10891.2,30\n"
+            "2026-09-10T17:15:00Z,MyApplication.exe,--server alpha --port 8001,4100,3.210,12.400,4500000000,1250,428.3,451.8,310.5,325.0,215.2,220.0,1048576,524288,18.72,37.20,10342.5,10891.2,30\n"
         );
     }
 
@@ -362,6 +368,8 @@ mod tests {
             app_priv_ram_peak_mb: 9.0,
             app_priv_active_avg_mb: 7.0,
             app_priv_active_peak_mb: 7.5,
+            app_net_rx_bytes: 0,
+            app_net_tx_bytes: 0,
             system_cpu_avg: 5.0,
             system_cpu_peak: 10.0,
             system_ram_avg_mb: 4000.0,
